@@ -1,0 +1,4 @@
+instagrapi
+openai
+python-dotenv
+requests
