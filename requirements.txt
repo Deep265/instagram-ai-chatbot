@@ -1,4 +1,4 @@
-instagrapi
+playwright
 openai
 python-dotenv
 requests

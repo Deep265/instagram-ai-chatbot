@@ -1,108 +1,218 @@
 import os
+import time
 import logging
-from instagrapi import Client
-from instagrapi.exceptions import LoginRequired
+import random
+from playwright.sync_api import sync_playwright
 
 class InstagramEngine:
     def __init__(self, username, password=None):
         self.username = username
         self.password = password
-        self.client = Client()
-        self.settings_file = "instagram_settings.json"
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+        self.user_data_dir = "playwright_session"
         self.logger = logging.getLogger(__name__)
 
+    def start(self, headless=False):
+        """Initializes the browser. Set headless=False to see the actions."""
+        self.playwright = sync_playwright().start()
+        self.logger.info("Initializing Chromium browser...")
+        
+        # Using launch_persistent_context to save session/cookies
+        self.context = self.playwright.chromium.launch_persistent_context(
+            user_data_dir=self.user_data_dir,
+            headless=headless,
+            viewport={'width': 1280, 'height': 720},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+        self.logger.info(f"Browser started (headless={headless})")
+
+    def handle_popups(self):
+        """Handles common Instagram popups that block navigation."""
+        popups = ["Not Now", "Save Info", "Allow all cookies", "Allow"]
+        for text in popups:
+            try:
+                # Use a short timeout to check if the button is there
+                btn = self.page.get_by_role("button", name=text, exact=False)
+                if btn.count() > 0 and btn.first.is_visible():
+                    self.logger.info(f"Found popup button '{text}', clicking...")
+                    btn.first.click()
+                    time.sleep(2)
+            except Exception:
+                pass
+
+    def stop(self):
+        """Closes the browser."""
+        if self.context:
+            self.context.close()
+        if self.playwright:
+            self.playwright.stop()
+
     def login(self, session_id=None):
-        """Attempts to login using various methods."""
-        # Add basic human-like delay configuration
-        self.client.delay_range = [5, 10]
-        
-        # If session_id is provided, try logging in with it first
+        """Logins to Instagram via UI or Session ID."""
+        if not self.page:
+            self.start()
+
+        # Try to set session ID cookie if provided
         if session_id:
-            try:
-                self.logger.info("Attempting login via SESSION_ID...")
-                self.client.login_by_sessionid(session_id)
-                self.logger.info("Logged in successfully using SESSION_ID.")
-                return True
-            except Exception as e:
-                self.logger.error(f"SESSION_ID login failed: {e}")
+            self.logger.info(f"Injecting SESSION_ID: {session_id[:10]}...")
+            self.context.add_cookies([{
+                'name': 'sessionid',
+                'value': session_id,
+                'domain': '.instagram.com',
+                'path': '/'
+            }])
 
-        # Try loading previous session settings
-        if os.path.exists(self.settings_file):
-            try:
-                self.client.load_settings(self.settings_file)
-                self.client.login(self.username, self.password)
-                self.logger.info("Logged in using existing settings.")
-                return True
-            except Exception as e:
-                self.logger.warning(f"Could not login with settings: {e}")
-        
-        return self.login_new()
+        self.logger.info("Navigating to Instagram Home...")
+        self.page.goto("https://www.instagram.com/")
+        time.sleep(5)
+        self.handle_popups()
 
-    def login_new(self):
-        """Performs a fresh login with a new device seed."""
-        try:
-            self.logger.info("Logging in with fresh credentials...")
-            self.client.login(self.username, self.password)
-            self.client.dump_settings(self.settings_file)
-            self.logger.info("Successfully logged in and saved settings.")
+        # Check if already logged in (look for search icon or profile)
+        if self.page.query_selector('svg[aria-label="Direct"]') or "direct/inbox" in self.page.url:
+            self.logger.info("Logged in successfully (session detected).")
             return True
-        except Exception as e:
-            self.logger.error(f"Fresh login failed: {e}")
-            raise e
 
-    def get_recent_threads(self, amount=20):
-        """Fetches recent message threads from the inbox."""
+        if "login" not in self.page.url and self.page.query_selector('input[name="username"]'):
+            pass # We are on the login form
+        elif "direct/inbox" not in self.page.url:
+            self.logger.info("Redirected to login or home, checking state...")
+
+        # Perform UI login if visible
         try:
-            threads = self.client.direct_threads(amount=amount)
-            return threads
+            # Try specific selectors provided by user or standard ones
+            username_field = self.page.query_selector('input[name="email"]') or self.page.query_selector('input[name="username"]')
+            password_field = self.page.query_selector('input[name="pass"]') or self.page.query_selector('input[name="password"]')
+
+            if username_field and password_field:
+                if not self.password:
+                    self.logger.error("Login form visible but no password provided in .env!")
+                    return False
+                
+                self.logger.info("Performing UI login with provided credentials...")
+                username_field.fill(self.username)
+                password_field.fill(self.password)
+                
+                # Try to click the "Log in" button
+                login_btn = self.page.get_by_text("Log in", exact=True)
+                if login_btn.count() > 0:
+                    login_btn.first.click()
+                else:
+                    # Fallback to submit button
+                    self.page.click('button[type="submit"]')
+                
+                self.logger.info("Waiting for login to complete...")
+                self.page.wait_for_load_state("networkidle", timeout=30000)
+                time.sleep(5)
+                self.handle_popups()
+                return True
         except Exception as e:
-            self.logger.error(f"Error fetching recent threads: {e}")
+            if self.page.query_selector('svg[aria-label="Direct"]'):
+                return True
+            self.logger.warning(f"Login process encountered an issue: {e}")
+        
+        return False
+
+    def get_recent_threads(self, amount=10):
+        """Scrapes the inbox for recent threads with logging."""
+        try:
+            self.logger.info("Fetching recent threads from inbox...")
+            self.page.goto("https://www.instagram.com/direct/inbox/")
+            time.sleep(3)
+            self.handle_popups()
+
+            # Wait for thread items
+            self.page.wait_for_selector('a[href^="/direct/t/"]', timeout=15000)
+            threads_elements = self.page.query_selector_all('a[href^="/direct/t/"]')
+            
+            self.logger.info(f"Found {len(threads_elements)} threads in side panel.")
+            
+            recent_threads = []
+            for i, elem in enumerate(threads_elements[:amount]):
+                href = elem.get_attribute('href')
+                thread_id = href.split('/')[-2] if href.endswith('/') else href.split('/')[-1]
+                
+                recent_threads.append({
+                    'id': thread_id,
+                    'href': href
+                })
+            
+            return recent_threads
+        except Exception as e:
+            self.logger.error(f"Error fetching threads: {e}")
             return []
 
-    def reset_session(self):
-        """Deletes settings file and re-logs in."""
-        if os.path.exists(self.settings_file):
-            os.remove(self.settings_file)
-        self.login_new()
-
-    def send_message(self, thread_id, text, retry=1):
-        """Sends a message to a specific thread with fallback, delay, and retry."""
-        import time
-        import random
-        
+    def get_messages(self, thread_id, amount=20):
+        """Fetches messages from a specific thread with context extraction."""
         try:
-            # Mimic human delay
-            time.sleep(random.uniform(3, 7))
+            self.logger.info(f"Opening thread {thread_id}...")
+            self.page.goto(f"https://www.instagram.com/direct/t/{thread_id}/")
             
-            # Try direct_send first
-            try:
-                self.client.direct_send(text, thread_ids=[thread_id])
-                self.logger.info(f"Sent message via direct_send to thread {thread_id}")
-                return True
-            except Exception as e:
-                error_msg = str(e)
-                if "404" in error_msg or "not found" in error_msg.lower():
-                    self.logger.warning(f"direct_send hit 404, trying direct_answer fallback")
-                    self.client.direct_answer(thread_id, text)
-                    self.logger.info(f"Sent message via direct_answer to thread {thread_id}")
-                    return True
-                
-                if retry > 0:
-                    self.logger.warning(f"Generic send error: {error_msg}. Retrying in 10s...")
-                    time.sleep(10)
-                    return self.send_message(thread_id, text, retry=retry-1)
-                
-                raise e
-                
-        except Exception as e:
-            self.logger.error(f"Error sending message to {thread_id}: {e}")
-            return False
+            # Wait for the messages container
+            # Instagram messages are in divs with role="row"
+            self.page.wait_for_selector('div[role="row"]', timeout=10000)
+            time.sleep(2) # Wait for animations
+            
+            rows = self.page.query_selector_all('div[role="row"]')
+            self.logger.info(f"Extracted {len(rows)} message rows for thread {thread_id}")
+            
+            messages = []
+            for row in rows[-amount:]:
+                try:
+                    # Look for the text inside the row
+                    # Often messages are in a div with some padding
+                    # We pick the span or div that has the actual text
+                    text_nodes = row.query_selector_all('span')
+                    if not text_nodes: continue
+                    
+                    # Usually the last span in the row contains the main text
+                    text = text_nodes[-1].inner_text().strip()
+                    if not text: continue
 
-    def mark_as_read(self, thread_id):
-        """Marks a thread as read."""
-        try:
-            # Note: direct_answer might mark it as read, but explicitly doing it depends on usage
-            # self.client.direct_thread_mark_unread(thread_id, False) # This is not always reliable
-            pass
+                    # Check alignment to determine role
+                    # Instagram uses flexbox; 'flex-end' means it's our message
+                    style = row.get_attribute('style') or ""
+                    # Also check parent div alignment
+                    parent_style = row.evaluate("el => window.get_computedStyle(el).justifyContent")
+                    
+                    is_mine = "flex-end" in style or "flex-end" in parent_style
+                    
+                    messages.append({
+                        'role': 'assistant' if is_mine else 'user',
+                        'content': text
+                    })
+                except:
+                    continue
+            
+            self.logger.info(f"Finished processing {len(messages)} valid messages.")
+            return messages
         except Exception as e:
-            self.logger.error(f"Error marking thread as read: {e}")
+            self.logger.error(f"Error fetching messages for {thread_id}: {e}")
+            return []
+
+    def send_message(self, thread_id, text):
+        """Sends a message by typing into the visible textbox."""
+        try:
+            self.logger.info(f"Sending response to {thread_id}...")
+            # Ensure we are on the right page
+            if f"/direct/t/{thread_id}" not in self.page.url:
+                self.page.goto(f"https://www.instagram.com/direct/t/{thread_id}/")
+            
+            # Find the input box
+            textarea = self.page.wait_for_selector('div[role="textbox"]', timeout=10000)
+            
+            # Type and Send
+            textarea.click()
+            self.page.keyboard.type(text, delay=random.uniform(30, 70))
+            time.sleep(1)
+            self.page.keyboard.press("Enter")
+            
+            self.logger.info("Message sent successfully via browser emulation.")
+            time.sleep(random.uniform(2, 4))
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to send message: {e}")
+            return False

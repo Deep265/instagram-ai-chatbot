@@ -3,3 +3,4 @@
 instagram_settings.json
 __pycache__/
 myenv/
+playwright_session/

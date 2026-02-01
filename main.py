@@ -51,73 +51,56 @@ def main():
         return
 
     # Initialize components
-    ig_engine = InstagramEngine(username) # Password still needed for fallback
-    ig_engine.password = password
+    ig_engine = InstagramEngine(username, password)
     bot = Chatbot(api_key, model=ai_model, base_url=base_url)
 
-    # Login to Instagram
+    # Login and Start Engine
     try:
+        ig_engine.start(headless=False) # Run in visible mode
         ig_engine.login(session_id=session_id)
     except Exception as e:
-        logger.error(f"Failed to login to Instagram: {e}")
+        logger.error(f"Failed to initialize Playwright engine: {e}")
         return
 
-    logger.info("Bot is running and listening for messages...")
+    logger.info("Bot is running (Playwright Mode)...")
 
     while True:
         try:
             recent_threads = ig_engine.get_recent_threads(amount=10)
             
-            for thread in recent_threads:
-                # Get the last message in the thread
-                if not thread.messages:
+            for thread_info in recent_threads:
+                thread_id = thread_info['id']
+                
+                # Fetch messages for this thread
+                history = ig_engine.get_messages(thread_id, amount=context_limit)
+                
+                if not history:
                     continue
                 
-                last_msg = thread.messages[0]
-                
-                # Logic: If the last message in the thread is NOT from the bot, it needs a reply
-                if str(last_msg.user_id) == str(ig_engine.client.user_id):
-                    # We are the last sender, no need to reply
+                # Check if the last message is from the user
+                last_msg = history[-1]
+                if last_msg['role'] == 'assistant':
+                    # Already replied or we sent the last message
                     continue
-                
-                user_text = last_msg.text
-                thread_id = thread.id
-                
-                logger.info(f"Thread {thread_id} needs a reply. Last message: '{user_text}' from user {last_msg.user_id}")
 
-                # Fetch conversation history
-                try:
-                    history_messages = ig_engine.client.direct_messages(thread_id, amount=context_limit)
-                    # instagrapi returns newest first, we need oldest first for the LLM
-                    history_messages.reverse()
-                    
-                    formatted_history = []
-                    for h_msg in history_messages:
-                        role = "assistant" if str(h_msg.user_id) == str(ig_engine.client.user_id) else "user"
-                        if h_msg.text: # Only include text messages
-                            formatted_history.append({"role": role, "content": h_msg.text})
-                    
-                    # Generate AI response with history
-                    ai_response = bot.generate_response(formatted_history)
-                except Exception as e:
-                    logger.error(f"Error fetching history for thread {thread_id}: {e}")
-                    # Fallback to single message if history fails
-                    ai_response = bot.generate_response([{"role": "user", "content": user_text}])
+                logger.info(f"Thread {thread_id} needs a reply. Last message: '{last_msg['content']}'")
+
+                # Generate AI response
+                ai_response = bot.generate_response(history)
                 
                 # Send response
                 if ig_engine.send_message(thread_id, ai_response):
                     logger.info(f"Successfully replied to thread {thread_id}")
-                    # Note: Depending on instagrapi version, we might need to marks as read
-                    # but usually sending a message handles the thread state.
                 
             time.sleep(check_interval)
             
         except KeyboardInterrupt:
             logger.info("Bot stopping...")
+            ig_engine.stop()
             break
         except Exception as e:
             logger.error(f"Error in main loop: {e}")
-            time.sleep(10) # Wait a bit before retrying after an error
+            time.sleep(10)
 
 if __name__ == "__main__":
     main()
