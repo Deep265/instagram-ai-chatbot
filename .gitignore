@@ -1,3 +1,5 @@
 .env
 .env.example
 instagram_settings.json
+__pycache__/
+myenv/
