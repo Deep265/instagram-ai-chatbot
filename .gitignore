@@ -4,3 +4,7 @@ instagram_settings.json
 __pycache__/
 myenv/
 playwright_session/
+chrome_session/
+artifacts/
+chrome-devtools-mcp/
+.claude/
