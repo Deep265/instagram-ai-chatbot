@@ -65,7 +65,7 @@ Always make the person feel like Nyra genuinely enjoys talking to them and cares
             return "Oops, I had a little hiccup! Try again in a moment 😊"
 
 if __name__ == "__main__":
-    bot = Chatbot(api_key="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", model="openrouter/free", base_url="https://openrouter.ai/api/v1")
+    bot = Chatbot(api_key="", model="openrouter/free", base_url="https://openrouter.ai/api/v1")
     history = [
         {"role": "user", "content": "Hi"},
         {"role": "assistant", "content": "Hello! How are you?"},
