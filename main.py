@@ -3,6 +3,9 @@ import time
 import logging
 import random
 from dotenv import load_dotenv
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
 from instagram_engine import InstagramEngine
 from chatbot import Chatbot
 
@@ -56,7 +59,7 @@ def main():
 
     # Login and Start Engine
     try:
-        ig_engine.start(headless=False)
+        ig_engine.start(headless=True)
         if not ig_engine.login(session_id=session_id):
             logger.error("Login failed. Shutting down bot.")
             ig_engine.stop()
@@ -77,7 +80,8 @@ def main():
     logger.info("Parallel Tabbed Worker System Active. Heartbeat active.")
     
     last_inbox_check = 0
-    inbox_check_interval = 60 # Check for new people once every minute
+    inbox_check_interval = 60  # Check for new people once every minute
+    replied_to = {}  # {thread_name: last_replied_message_text} — prevents double-replies
 
     while True:
         try:
@@ -88,67 +92,91 @@ def main():
                 logger.error("Browser session lost. Attempting to restart...")
                 ig_engine.stop()
                 time.sleep(5)
-                ig_engine.start(headless=False)
+                ig_engine.start(headless=True)
                 ig_engine.login(session_id=session_id)
                 continue
 
-            # 2. Poll Inbox for NEW Unread Threads (Only every 60 seconds)
+            # 2. Poll Inbox for threads (every 60 seconds)
             if time.time() - last_inbox_check > inbox_check_interval:
-                logger.info("Scanning inbox for NEW conversations...")
+                logger.info("Scanning inbox for conversations...")
+                # FIX: Get ALL recent threads, not just unread ones
                 recent_threads = ig_engine.get_recent_threads(amount=10)
-                unread_threads = [t for t in recent_threads if t.get('is_unread', False)]
-                
-                if unread_threads:
-                    logger.info(f"Found {len(unread_threads)} people requiring attention.")
-                    # 3. Open tabs for any NEW people
-                    for thread in unread_threads:
+
+                if recent_threads:
+                    logger.info(f"Found {len(recent_threads)} threads in inbox.")
+                    for thread in recent_threads:
                         name = thread['name']
                         if name not in ig_engine.tabs:
                             if len(ig_engine.tabs) < 5:
                                 if ig_engine.ensure_thread_tab(name, thread['element']):
-                                    # Return to main handle to finish scanning others
                                     ig_engine.driver.switch_to.window(ig_engine.main_handle)
                             else:
                                 logger.warning(f"Slot full! Cannot open tab for {name} yet.")
-                
+
                 last_inbox_check = time.time()
 
-            # 4. Process All Active Worker Tabs (No Refresh)
+            # 3. Process All Active Worker Tabs
             active_names = list(ig_engine.tabs.keys())
+            logger.info(f"Processing active names : {active_names}")
             for name in active_names:
+                handle = ig_engine.tabs.get(name)
+                if not handle:
+                    logger.info(f"No handle Found with name {name}")
+                    continue
                 try:
-                    handle = ig_engine.tabs[name]
                     if handle in ig_engine.driver.window_handles:
                         ig_engine.driver.switch_to.window(handle)
-                        time.sleep(1) # Wait for DOM
-                        
-                        # Read messages (reads from current tab DOM)
-                        current_url = ig_engine.driver.current_url
-                        history = ig_engine.get_messages(current_url, limit=context_limit)
-                        
+
+                        # Wait for the message input to be present — confirms chat is loaded
+                        try:
+                            WebDriverWait(ig_engine.driver, 8).until(
+                                EC.presence_of_element_located(
+                                    (By.CSS_SELECTOR, 'div[contenteditable="true"], textarea')
+                                )
+                            )
+                        except Exception:
+                            time.sleep(3)  # fallback if WebDriverWait import not available in scope
+
+                        # Use the stored thread URL for this worker if available
+                        target_url = ig_engine.thread_urls.get(name, ig_engine.driver.current_url)
+                        history = ig_engine.get_messages(target_url, limit=context_limit)
+
+                        logger.info(f"History for {name} : {history}")
+
                         if not history:
+                            logger.warning(f"No messages read for {name} — skipping.")
                             continue
-                            
+
                         last_msg = history[-1]
-                        if last_msg['role'] == 'user':
-                            logger.info(f"Nyra is thinking for {name}...")
+                        last_content = last_msg.get('content', '')
+                        already_replied = replied_to.get(name) == last_content
+
+                        logger.info(f"[{name}] Last msg role={last_msg['role']!r} | already_replied={already_replied} | text={last_content[:40]!r}")
+                        if last_msg['role'] == 'user' and not already_replied:
+                            logger.info(f"Generating reply for {name}...")
                             ai_response = bot.generate_response(history)
-                            
-                            # Check for [SILENCE] tag
+
                             if ai_response.startswith("[SILENCE]"):
-                                logger.info(f"[AI Decision] Staying silent for {name}: {ai_response}")
+                                logger.info(f"[AI] Silent for {name}: {ai_response}")
+                                replied_to[name] = last_content
                                 continue
 
-                            if ig_engine.send_message(current_url, ai_response):
-                                logger.info(f"Replied to {name}. Staying on tab for follow-ups.")
+                            if ig_engine.send_message(target_url, ai_response):
+                                logger.info(f"✅ Replied to {name}: {ai_response[:60]!r}")
+                                replied_to[name] = last_content
                                 time.sleep(2)
+                        elif last_msg['role'] == 'assistant':
+                            logger.info(f"[{name}] Last message is ours — waiting for their reply.")
+                        elif already_replied:
+                            logger.info(f"[{name}] Already replied to this message — waiting.")
+
                 except Exception as e:
                     logger.error(f"Worker tab error ({name}): {e}")
-                    # Only close if the window was actually shut by the user
                     if handle not in ig_engine.driver.window_handles:
-                        del ig_engine.tabs[name]
+                        if name in ig_engine.tabs:
+                            del ig_engine.tabs[name]
 
-            # 5. Small pacing delay between whole-system cycles
+            # 4. Small pacing delay between cycles
             time.sleep(random.uniform(3.0, 6.0))
             
         except KeyboardInterrupt:

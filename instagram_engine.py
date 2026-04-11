@@ -1,3 +1,4 @@
+from dotenv.main import logger
 import os
 import time
 import random
@@ -18,8 +19,10 @@ class InstagramEngine:
         self.username = username
         self.password = password
         self.driver = None
-        self.tabs = {}  # {thread_id: window_handle}
+        self.tabs = {}  # {thread_name: window_handle}
+        self.thread_urls = {} # {thread_name: canonical_url}
         self.main_handle = None
+        self.full_name = "Nyra" # Default if not set
 
     def start(self, headless=False):
         self.logger.info("Initializing undetected-chromedriver...")
@@ -281,32 +284,32 @@ class InstagramEngine:
         self.logger.info("Inbox loaded.")
 
     def get_recent_threads(self, amount=10):
-        """Scrapes the inbox for recent conversation threads and detects unread status."""
-        
+        """Scrapes the inbox for recent conversation threads."""
+
         # Ensure we are on the main handle
         if self.main_handle and self.driver.current_window_handle != self.main_handle:
             self.driver.switch_to.window(self.main_handle)
-            
+
         if "direct/inbox" not in self.driver.current_url:
             self.driver.get('https://www.instagram.com/direct/inbox/')
             time.sleep(4)
 
         threads = []
         try:
-            # Find all buttons in Sidebar
+            # Instagram renders each conversation as a div[role="button"] in the sidebar.
+            # Rows that contain a middle-dot '·' are conversation previews (timestamp separator).
             buttons = self.driver.find_elements(By.CSS_SELECTOR, 'div[role="button"]')
-            # Elements containing middle-dot '·' are thread rows
-            elements = [b for b in buttons if '·' in b.text and any(x in b.text for x in ['m', 'h', 'd', 'w'])]
+            elements = [b for b in buttons if '·' in b.text and any(x in b.text for x in ['m', 'h', 'd', 'w', 's'])]
 
             for el in elements[:amount]:
                 try:
                     text = el.text.strip()
-                    name_text = text.split('\n')[0]
-                    
-                    # Instagram uses Unread text or specific bold patterns for new messages
-                    # We also check if the last activity was not us sending an attachment/message
-                    is_unread = "Unread" in text or ("sent" not in text.lower() and "Reacted" not in text and "You:" not in text)
-                    
+                    name_text = text.split('\n')[0].strip()
+
+                    # FIX: Only mark as unread when Instagram explicitly says "Unread"
+                    # The old logic flagged almost every thread as unread
+                    is_unread = "Unread" in text
+
                     threads.append({
                         "name": name_text,
                         "is_unread": is_unread,
@@ -317,6 +320,8 @@ class InstagramEngine:
 
         except Exception as e:
             self.logger.error(f"Error fetching threads: {e}")
+        
+        logger.info(f"Recent Threads Output : {threads}")
         return threads
 
     def ensure_thread_tab(self, thread_name, element):
@@ -326,52 +331,71 @@ class InstagramEngine:
                 handle = self.tabs[thread_name]
                 if handle in self.driver.window_handles:
                     self.driver.switch_to.window(handle)
+                    logger.info(f"Thread tab open successfull for {thread_name}")
                     return True
                 else:
+                    logger.info(f"Thread tab not found for {thread_name}")
                     del self.tabs[thread_name]
             except Exception:
                 if thread_name in self.tabs:
+                    logger.info(f"Exception in thread tab for {thread_name}")
                     del self.tabs[thread_name]
 
         # Limit to 5 worker tabs
         if len(self.tabs) >= 5:
             return False
 
-        self.logger.info(f"Opening worker tab for: {thread_name}")
+        self.logger.info(f"Attempting to open worker tab for: {thread_name}")
         try:
-            # Scroll to element to ensure it's interactable
+            # 1. Capture current inbox location to return later
+            inbox_url = self.driver.current_url
+
+            # 2. Click the chat row normally to navigate there in the main tab
+            self.logger.info(f"Clicking thread for {thread_name} to capture URL...")
             self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
             time.sleep(0.5)
+            
+            # Use JS click for speed and to avoid overlays
+            self.driver.execute_script("arguments[0].click();", element)
+            
+            # 3. Wait for the URL to change to a thread URL (.../direct/t/...)
+            thread_url = None
+            for _ in range(15): # Max 7.5 seconds wait
+                current_url = self.driver.current_url
+                if "/direct/t/" in current_url:
+                    thread_url = current_url
+                    break
+                time.sleep(0.5)
+            
+            if not thread_url:
+                self.logger.error(f"Failed to capture thread URL for {thread_name} after click.")
+                # Return to inbox if stuck
+                self.driver.get(inbox_url)
+                return False
 
-            # Try to get the URL from the parent <a> tag if it exists
-            # Instagram often wraps these buttons in an <a> tag
-            try:
-                link_el = element.find_element(By.XPATH, "./ancestor::a")
-                thread_url = link_el.get_attribute("href")
-                if thread_url:
-                    self.driver.execute_script(f"window.open('{thread_url}', '_blank');")
-                    time.sleep(2)
-                    handles = self.driver.window_handles
-                    new_handle = handles[-1]
-                    self.tabs[thread_name] = new_handle
-                    self.driver.switch_to.window(new_handle)
-                    return True
-            except Exception:
-                pass
+            self.logger.info(f"Captured thread URL: {thread_url}")
 
-            # Fallback to Control+Click if URL extraction fails
-            ActionChains(self.driver).key_down(Keys.CONTROL).click(element).key_up(Keys.CONTROL).perform()
-            time.sleep(3)
+            # 4. Open this specific thread URL in a NEW tab/window
+            self.driver.execute_script(f"window.open('{thread_url}', '_blank');")
+            time.sleep(2)
             
             handles = self.driver.window_handles
-            if len(handles) > len(self.tabs) + 1:
-                new_handle = handles[-1]
-                self.tabs[thread_name] = new_handle
-                self.driver.switch_to.window(new_handle)
-                return True
+            new_handle = handles[-1]
+            self.tabs[thread_name] = new_handle
+            self.thread_urls[thread_name] = thread_url # Store recorded URL
             
+            # 5. Return the MAIN tab to the inbox so it can monitor other chats
+            self.logger.info("Returning main tab to inbox overview...")
+            self.driver.switch_to.window(self.main_handle)
+            self.driver.get("https://www.instagram.com/direct/inbox/")
+            time.sleep(1)
+            
+            return True
+
         except Exception as e:
-            self.logger.error(f"Failed to open tab for {thread_name}: {e}")
+            self.logger.error(f"Error in Click-and-Capture for {thread_name}: {e}")
+            try: self.driver.switch_to.window(self.main_handle)
+            except: pass
             
         return False
 
@@ -383,7 +407,8 @@ class InstagramEngine:
                 if handle in self.driver.window_handles:
                     self.driver.switch_to.window(handle)
                     self.driver.close()
-                del self.tabs[thread_name]
+                if thread_name in self.tabs: del self.tabs[thread_name]
+                if thread_name in self.thread_urls: del self.thread_urls[thread_name]
         except Exception:
             pass
         finally:
@@ -392,64 +417,169 @@ class InstagramEngine:
                     self.driver.switch_to.window(self.main_handle)
             except: pass
 
-    def get_messages(self, url, limit=5):
-        """Reads recent messages from the current thread (no refresh if already there)."""
-        # Normalize URLs for comparison (strip trailing slashes)
-        current_url = self.driver.current_url.rstrip('/')
-        target_url = url.split('?')[0].rstrip('/')  # Ignore query params
+    def get_messages(self, url, limit=10):
+        """
+        Reads recent messages using JavaScript DOM extraction.
+
+        HOW ROLE DETECTION WORKS (learned from live DOM inspection):
+        - The chat panel is a narrow column. ALL messages sit between left~357-550px.
+          A viewport-midpoint (640px) misclassifies everything as incoming.
+        - Fix: auto-detect the panel center from min/max left of all candidate nodes,
+          then use that as the split point. right of panel-center = you, left = them.
+        - Sidebar exclusion: sidebar items sit at left < 200px. We skip those entirely.
+        - Every message appears as both SPAN (leaf) and DIV (wrapper). We pick the leaf
+          by skipping any node whose child [dir=auto] has the same innerText.
+        """
+        import re
+
+        current_url = self.driver.current_url.split("?")[0].rstrip("/")
+        target_url = url.split("?")[0].rstrip("/")
 
         if current_url != target_url:
             self.logger.info(f"Navigating to thread: {url}")
             self.driver.get(url)
-            time.sleep(4)
+            try:
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, 'div[contenteditable="true"], textarea')
+                    )
+                )
+            except Exception:
+                time.sleep(5)
+
+        self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2)
 
         messages = []
         try:
-            # Broader search for message bubbles
-            msg_els = self.driver.find_elements(By.CSS_SELECTOR, 'main span, div[dir="auto"]')
-            
-            seen_texts = set()
-            for el in msg_els:
-                try:
-                    text = el.text.strip()
-                    # Skip noise: timestamps, single letters, or empty strings
-                    if not text or len(text) < 1 or '·' in text or text in seen_texts:
-                        continue
-                    
-                    # More resilient Role Detection
-                    role = "user" # Default to user
-                    
-                    # 1. Check for manual prefix if present in some views
-                    if text.startswith("You:"):
-                        role = "assistant"
-                        text = text.replace("You:", "").strip()
-                    else:
-                        # 2. Check for alignment or authorship via parent element class/style
-                        try:
-                            # Higher level container often has classes like 'xexx8yu' or styles
-                            container = el.find_element(By.XPATH, "./ancestor::div[contains(@class, ' ') or @style][1]")
-                            style = container.get_attribute("style") or ""
-                            classes = container.get_attribute("class") or ""
-                            
-                            if "flex-end" in style or "x6s0dn4" in classes: # Common alignment indicators
-                                role = "assistant"
-                            elif "flex-start" in style or "x78zum5" in classes:
-                                role = "user"
-                            else:
-                                # 3. Fallback: Check for profile picture link (usually present for incoming)
-                                is_incoming = container.find_elements(By.XPATH, ".//img") or el.find_elements(By.XPATH, "./ancestor::div[1]//img")
-                                role = "user" if is_incoming else "assistant"
-                        except Exception:
-                            pass
+            raw = self.driver.execute_script("""
+                var candidates = [];
+                var allDirAuto = Array.from(document.querySelectorAll("[dir=auto]"));
 
-                    # Avoid adding identical consecutive messages
-                    messages.append({"role": role, "content": text})
-                    seen_texts.add(text)
-                except Exception:
+                allDirAuto.forEach(function(node) {
+                    var text = (node.innerText || "").trim();
+                    if (!text || text.length < 2) return;
+
+                    var rect = node.getBoundingClientRect();
+                    if (rect.height === 0 || rect.width === 0) return;
+
+                    // SIDEBAR/HEADER EXCLUSION: Skip everything on far left (Sidebar)
+                    // Thread content starts at ~300px+
+                    if (rect.left < 300) return;
+
+                    // Skip wrapper divs: if any child [dir=auto] has the exact same text,
+                    // this node is just a container — skip it, we will pick the child.
+                    var children = node.querySelectorAll("[dir=auto]");
+                    var isWrapper = false;
+                    for (var i = 0; i < children.length; i++) {
+                        if ((children[i].innerText || "").trim() === text) {
+                            isWrapper = true;
+                            break;
+                        }
+                    }
+                    if (isWrapper) return;
+
+                    // CLASS-BASED ROLE DETECTION
+                    // Instagram usually wraps outgoing (assistant) messages in classes like 'x6s0dn4'
+                    // and incoming (user) in 'x78zum5' or similar.
+                    var role = "user";
+                    var parent = node.closest('div[class]');
+                    if (parent) {
+                        var cls = parent.className || "";
+                        // x6s0dn4 is a common right-aligned container class
+                        if (cls.includes("x6s0dn4")) role = "assistant";
+                        else if (cls.includes("x78zum5")) role = "user";
+                    }
+
+                    candidates.push({ text: text, left: rect.left, top: rect.top, role: role });
+                });
+
+                if (candidates.length === 0) return [];
+
+                // PANEL MIDPOINT for cases where classes aren't clear
+                var lefts = candidates.map(function(c) { return c.left; });
+                var minLeft = Math.min.apply(null, lefts);
+                var maxLeft = Math.max.apply(null, lefts);
+                var panelMid = (minLeft + maxLeft) / 2 + 50;
+
+                var results = candidates.map(function(c) {
+                    var finalRole = c.role;
+                    // If class-based detection is ambiguous, use position fallback
+                    if (finalRole === "user" && c.left >= panelMid) finalRole = "assistant";
+                    
+                    return {
+                        text: c.text,
+                        role: finalRole,
+                        top: c.top,
+                        left: c.left
+                    };
+                });
+
+                results.sort(function(a, b) { return a.top - b.top; });
+                return results;
+            """)
+
+            logger.info(f"RAW Message Output : {raw}")
+
+            if not raw:
+                self.logger.warning("JS extraction returned no elements.")
+                return []
+
+            lefts = [r["left"] for r in raw]
+            panel_mid_used = (min(lefts) + max(lefts)) / 2 + 30
+            self.logger.info(
+                f"Panel left range: {min(lefts):.0f}-{max(lefts):.0f}px | "
+                f"split at: {panel_mid_used:.0f}px"
+            )
+
+            # --- NOISE FILTERS ---
+            NOISE_EXACT = {
+                "today", "yesterday", "seen", "delivered", "active now",
+                "send message", "message", "send", "new message", "note",
+                "primary", "general", "requests", "your note",
+                "your messages", "send private photos and messages to a friend or group.",
+                "send a message to start a chat", "active"
+            }
+            TIMESTAMP_RE = re.compile(r"^\d{1,2}:\d{2}\s*(am|pm)?$", re.IGNORECASE)
+            DAY_TIME_RE = re.compile(
+                r"^(mon|tue|wed|thu|fri|sat|sun)\s+\d{1,2}:\d{2}", re.IGNORECASE
+            )
+            DATE_RE = re.compile(
+                r"^(january|february|march|april|may|june|july|august|"
+                r"september|october|november|december|\d{1,2}/\d{1,2})",
+                re.IGNORECASE
+            )
+            DURATION_RE = re.compile(r"^\d{1,2}[mhdw]$", re.IGNORECASE)
+
+            for item in raw:
+                text = item["text"].strip()
+                role = item["role"]
+
+                # Detailed filtering
+                if not text or len(text) < 1:
+                    continue
+                if "·" in text:
+                    continue
+                if text.lower() in NOISE_EXACT:
+                    continue
+                
+                # Exclude profile headers/usernames (Deepak Chaudhari, deepakchaudhari265, etc.)
+                if text == self.username or (hasattr(self, 'full_name') and text == self.full_name):
                     continue
 
-            # self.logger.info(f"Read {len(messages)} unique messages from {target_url}")
+                if TIMESTAMP_RE.match(text) or DAY_TIME_RE.match(text) or DATE_RE.match(text) or DURATION_RE.match(text):
+                    continue
+
+                # NOTE: We allow duplicates (Hi, Hello) to preserve conversation flow.
+                messages.append({"role": role, "content": text})
+
+            # Check if history is JUST landing page garbage - if so return empty to wait
+            if len(messages) == 0:
+                self.logger.debug("Chat is currently showing empty-state landing page.")
+
+            self.logger.info(f"Read {len(messages)} unique message items from thread.")
             return messages[-limit:]
+
         except Exception as e:
             self.logger.error(f"Error fetching messages: {e}")
 
@@ -458,58 +588,84 @@ class InstagramEngine:
     def send_message(self, url, text):
         """Sends a message to the specified thread."""
         self.logger.info(f"Sending message to {url}...")
-        if self.driver.current_url != url:
+        
+        # Don't try to send messages to the generic inbox URL!
+        if "/direct/t/" not in url:
+            self.logger.error(f"Cannot send message to non-thread URL: {url}")
+            return False
+
+        # Ensure we are on the correct thread URL
+        if self.driver.current_url.split('?')[0].rstrip('/') != url.split('?')[0].rstrip('/'):
             self.driver.get(url)
             time.sleep(4)
 
         try:
-            # Find the message input box
+            # Expanded selector list for the message input field (updated for latest UI)
             selectors = [
+                (By.CSS_SELECTOR, "div[role='textbox'][aria-label*='Message']"),
+                (By.CSS_SELECTOR, 'textarea[aria-label="Message"]'),
                 (By.CSS_SELECTOR, 'div[aria-label="Message"]'),
                 (By.CSS_SELECTOR, 'div[contenteditable="true"]'),
-                (By.XPATH, "//div[@role='textbox' and @aria-label='Message']")
+                (By.XPATH, "//div[@role='textbox' and @aria-label='Message']"),
+                (By.XPATH, "//textarea[@aria-label='Message']"),
+                (By.CSS_SELECTOR, "div[role='textbox']"),
+                (By.XPATH, "//textarea[@role='textbox']"),
             ]
-            
+
             box = None
             for by, sel in selectors:
                 try:
                     elements = self.driver.find_elements(by, sel)
                     if elements:
                         box = elements[0]
+                        self.logger.debug(f"Found message input using selector {sel} ({by})")
                         break
-                except Exception:
+                except Exception as e:
+                    self.logger.debug(f"Selector {sel} ({by}) raised {e}")
                     continue
 
-            if box:
-                # Human-like interaction: focus, click, type
-                self.driver.execute_script("arguments[0].focus(); arguments[0].click();", box)
-                time.sleep(0.5)
-                ActionChains(self.driver).move_to_element(box).click().perform()
-                time.sleep(0.5)
-                
-                # Type human-like
-                for char in text:
-                    box.send_keys(char)
-                    time.sleep(random.uniform(0.04, 0.15))
-                
-                time.sleep(0.5)
-                box.send_keys(Keys.ENTER)
-                time.sleep(2)
-                self.logger.info("Message sent successfully.")
-                return True
-            else:
-                self.logger.error("Could not find message input box.")
+            if not box:
+                self.logger.error("Could not locate the message input box with any selector.")
+                return False
+
+            # Focus the input box
+            self.driver.execute_script("arguments[0].focus();", box)
+            time.sleep(0.2)
+
+            # --- EMOJI-SAFE TYING ---
+            # ChromeDriver's send_keys fails for non-BMP characters like emojis.
+            # We use JS execCommand to insert text directly into the contenteditable div.
+            self.driver.execute_script("""
+                var el = arguments[0];
+                var text = arguments[1];
+                el.innerText = ''; // Clear first
+                // Use execCommand to preserve Instagram's internal state
+                if (document.queryCommandSupported('insertText')) {
+                    document.execCommand('insertText', false, text);
+                } else {
+                    el.innerText = text;
+                }
+                // Trigger input events so the 'Send' button activates
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            """, box, text)
+            
+            time.sleep(1)
+            box.send_keys(Keys.ENTER)
+            # Wait for the message bubble to appear (basic verification)
+            time.sleep(2)
+            self.logger.info("Message sent successfully.")
+            return True
         except Exception as e:
             self.logger.error(f"Error sending message: {e}")
-        return False
+            return False
 
     def print_inbox_summary(self, max_threads=10, messages_per_thread=10):
-        """Fetch all inbox threads and print messages per user in the terminal (sequential for stability)."""
+        """Fetch all inbox threads and print messages per user in the terminal."""
         print("\n" + "=" * 60)
         print("📬 INSTAGRAM INBOX SUMMARY")
         print("=" * 60)
 
-        # Force stay on main handle for summary
         if self.main_handle and self.driver.current_window_handle != self.main_handle:
             self.driver.switch_to.window(self.main_handle)
 
@@ -528,18 +684,33 @@ class InstagramEngine:
             print(f"{'─' * 60}")
 
             try:
-                # Re-find thread element to avoid staleness
-                current_btns = self.driver.find_elements(By.CSS_SELECTOR, 'div[role="button"]')
+                current_btns = self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    'div[role="listbox"] div[role="button"], div[role="list"] div[role="button"]'
+                )
+                if not current_btns:
+                    current_btns = self.driver.find_elements(By.CSS_SELECTOR, 'div[role="button"]')
+
                 target_btn = None
                 for btn in current_btns:
-                    if name in btn.text:
+                    first_line = btn.text.strip().split('\n')[0].strip()
+                    if first_line == name:
                         target_btn = btn
                         break
-                
+
                 if target_btn:
                     self.driver.execute_script("arguments[0].click();", target_btn)
-                    time.sleep(4)
-                    
+                    # Wait for the chat input to appear — confirms the thread is loaded
+                    try:
+                        WebDriverWait(self.driver, 10).until(
+                            EC.presence_of_element_located(
+                                (By.CSS_SELECTOR, 'div[contenteditable="true"], textarea')
+                            )
+                        )
+                    except Exception:
+                        time.sleep(5)
+
+                    # FIX: pass messages_per_thread as the limit so we actually get that many
                     messages = self.get_messages(self.driver.current_url, limit=messages_per_thread)
                     if not messages:
                         print("     (No messages found yet or unable to parse DOM)")
@@ -547,10 +718,13 @@ class InstagramEngine:
                         for msg in messages:
                             sender_icon = "🤖 You" if msg['role'] == 'assistant' else "👤 Them"
                             print(f"     {sender_icon}: {msg['content']}")
-                
-                # Head back to inbox safely
+                else:
+                    print(f"     (Could not find thread button for '{name}')")
+
+                # Navigate back to inbox
                 self.driver.get('https://www.instagram.com/direct/inbox/')
                 time.sleep(3)
+
             except Exception as e:
                 print(f"     (Error reading messages: {e})")
 

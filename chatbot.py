@@ -51,13 +51,25 @@ Always make the person feel like Nyra genuinely enjoys talking to them and cares
         """Generates a response using OpenAI API with conversation history."""
         try:
             messages = [{"role": "system", "content": self.system_prompt}] + conversation_history
-            
+
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 max_tokens=150
             )
-            return response.choices[0].message.content.strip()
+            print("AI Response : ",response)
+            content = response.choices[0].message.content
+            return content.strip() if content else "[SILENCE] Empty response from AI"
         except Exception as e:
             self.logger.error(f"Error generating AI response: {e}")
-            return "I'm sorry, I'm having trouble thinking right now. Could you try again later?"
+            return "Oops, I had a little hiccup! Try again in a moment 😊"
+
+if __name__ == "__main__":
+    bot = Chatbot(api_key="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", model="openrouter/free", base_url="https://openrouter.ai/api/v1")
+    history = [
+        {"role": "user", "content": "Hi"},
+        {"role": "assistant", "content": "Hello! How are you?"},
+        {"role": "user", "content": "I'm good, thanks!"}
+    ]
+    response = bot.generate_response(history)
+    print(response)
